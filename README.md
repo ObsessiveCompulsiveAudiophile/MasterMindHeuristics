@@ -34,7 +34,7 @@ T+2423.80s Gen 20: !!! NEW BEST: 4.35802469 !!!
 ...
 
 
-Note: A full game tree average of 4.3565 has been achieved (in less then 48 hours of training) and this is a heuristic strategy "World record" for MasterMid game and ranks only second after Koyoma & Lai's brute force DFS optimal algorithm (4.3403)
+Note: A full game tree average of 4.3565 has been achieved (in less then 48 hours of training) and this is a heuristic strategy "World record" for MasterMind game and ranks only second after Koyoma & Lai's brute force DFS optimal algorithm (4.3403)
 
 ## The Strategy
 
