@@ -124,7 +124,8 @@ This project employs several advanced optimization techniques to achieve high pe
 
 The optimizer can discover highly effective coefficient sets that achieve near-optimal average scores. The console log shows the progress over time, tracking the best score found and the number of generations without improvement ("Stagnation").
 
-**Possible future experiments and improvements:**
--   **Allowing Negative Coefficients**: Modify the bounds in the `reproduceAndMutateKernel` to allow negative weights, which could enable the algorithm to learn to *avoid* certain low-value feedback marks.
--   **Cataclysmic Mutation**: Introduce a mechanism to dramatically re-randomize a portion of the population after extreme stagnation (e.g., >2000 generations) to escape deep local optima.
--   **Tuning GA Parameters**: Experiment with different population sizes, parent selection ratios, and mutation strength decay rates to see how they affect convergence speed and the quality of the final solution.
+****Further applied the below improvements on Jul 12 2025****
+-   **Adaptive Mutation Parameters**
+-   **Enhanced Crossover and Mutation Kernel**
+-   **Population Diversity Tracking**
+-   **Improved Initialisation**
