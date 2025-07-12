@@ -139,9 +139,14 @@ Starting search...
 
 T+114.84s Gen 1: !!! NEW BEST: 4.35648148 !!!
   Coefficients: [ 1.24 1.34 1.35 0.95 0.86 1.25 1.33 1.17 1.03 1.10 1.13 1.30 1.05 2.32 ]
+  
   [Diversity: 51.72, Stagnation: 150] Increasing mutation: rate=0.216, amount=16
+  
   [Diversity: 66.24, Stagnation: 150] Increasing mutation: rate=0.300, amount=17
+  
   T+40924.52s Gen 333: !!! NEW BEST: 4.35570988 !!!
+  
   Coefficients: [ 1.24 1.34 1.42 1.03 0.79 1.25 1.33 1.17 1.00 1.08 1.11 1.33 1.10 2.27 ]
+  
   
 
