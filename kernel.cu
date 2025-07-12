@@ -24,18 +24,26 @@ const int NUM_COEFS = 14;
 const int POPULATION_SIZE = 4096;
 const int NUM_GENERATIONS = 50000;
 const int NUM_PARENTS = POPULATION_SIZE / 4;
-const float INITIAL_MUTATION_STRENGTH = 0.05f;
-const float FINAL_MUTATION_STRENGTH = 0.005f;
+// --- MODIFIED --- New parameters for adaptive mutation
+constexpr float INITIAL_MUTATION_RATE = 0.15f;
+constexpr float MIN_MUTATION_RATE = 0.01f;
+constexpr int INITIAL_MUTATION_AMOUNT = 15;
+constexpr int MIN_MUTATION_AMOUNT = 2;
+constexpr int STAGNATION_THRESHOLD = 100; // generations without improvement
+
 
 // =================================================================================
-//  KERNEL FORWARD DECLARATIONS (FLOAT VERSION)
+//  KERNEL FORWARD DECLARATIONS
 // =================================================================================
 
-// --- MODIFIED --- The log2 table is passed as a pointer argument again.
-__global__ void evaluatePopulationKernel_Optimized(const float* __restrict__ d_all_coefs, const int* __restrict__ d_mark, const float* __restrict__ d_log2_table, uint64_t* __restrict__ d_iValid_scratch, int o_start, int num_games_in_batch, uint64_t* __restrict__ d_sum_scratch);
-__global__ void reproduceAndMutateKernel(const float* __restrict__ d_current_pop, float* __restrict__ d_next_pop, const int* __restrict__ d_parent_indices, curandState* __restrict__ states, int population_size, int num_coefs, int num_parents, float mutation_strength);
+// --- MODIFIED --- Kernels now take int* for populations
+__global__ void evaluatePopulationKernel_Optimized(const int* __restrict__ d_all_coefs, const int* __restrict__ d_mark, const float* __restrict__ d_log2_table, uint64_t* __restrict__ d_iValid_scratch, int o_start, int num_games_in_batch, uint64_t* __restrict__ d_sum_scratch);
 __global__ void finalizeResultsKernel(const uint64_t* __restrict__ d_sum_scratch, double* __restrict__ d_results, int num_elements);
 __global__ void initCurandKernel(curandState* states, unsigned long long seed, int n);
+// --- MODIFIED --- New and updated kernel declarations
+__global__ void reproduceAndMutateKernel_Adaptive(const int* __restrict__ d_current_pop, int* __restrict__ d_next_pop, const int* __restrict__ d_parent_indices, curandState* __restrict__ states, int population_size, int num_coefs, int num_parents, float mutation_rate, int mutation_amount, int generation);
+__global__ void calculateDiversityKernel(const int* __restrict__ d_population, float* __restrict__ d_diversity_scratch, int population_size, int num_coefs);
+
 
 // =================================================================================
 //  KERNELS
@@ -47,8 +55,8 @@ __global__ void finalizeResultsKernel(const uint64_t* __restrict__ d_sum_scratch
     d_results[idx] = (double)d_sum_scratch[idx] / S;
 }
 
-// --- MODIFIED --- This is the key change. We use __ldg() to read from the log2 table pointer.
-__global__ void evaluatePopulationKernel_Optimized(const float* __restrict__ d_all_coefs, const int* __restrict__ d_mark, const float* __restrict__ d_log2_table,
+// --- MODIFIED --- Takes int* for coefficients and converts them to float on the fly
+__global__ void evaluatePopulationKernel_Optimized(const int* __restrict__ d_all_coefs, const int* __restrict__ d_mark, const float* __restrict__ d_log2_table,
     uint64_t* __restrict__ d_iValid_scratch, int o_start, int num_games_in_batch,
     uint64_t* __restrict__ d_sum_scratch)
 {
@@ -61,7 +69,10 @@ __global__ void evaluatePopulationKernel_Optimized(const float* __restrict__ d_a
 
     float my_coefs[NUM_COEFS];
 #pragma unroll
-    for (int i = 0; i < NUM_COEFS; ++i) my_coefs[i] = d_all_coefs[population_idx * NUM_COEFS + i];
+    for (int i = 0; i < NUM_COEFS; ++i) {
+        // --- KEY CHANGE: Convert from integer genotype to float phenotype ---
+        my_coefs[i] = (float)d_all_coefs[population_idx * NUM_COEFS + i] / 100.0f;
+    }
 
     float scores[S];
     int k_best_first_guess;
@@ -69,20 +80,17 @@ __global__ void evaluatePopulationKernel_Optimized(const float* __restrict__ d_a
 
     { // First guess calculation block
         const uint64_t initial_n = S;
-        // --- Use __ldg() to load from read-only cache ---
         const float log2_initial_n = __ldg(&d_log2_table[initial_n]);
 
         for (int k = 0; k < S; k++) {
             uint64_t temp_counts[NUM_COEFS] = { 0 };
-            for (int i = 0; i < initial_n; i++) {
-                temp_counts[d_mark[k * S + i]]++;
-            }
+            for (int i = 0; i < initial_n; i++) temp_counts[d_mark[k * S + i]]++;
+
             scores[k] = 0.0f;
 #pragma unroll
             for (int j = 0; j < NUM_COEFS; j++) {
                 if (temp_counts[j] > 0) {
                     float p = (float)temp_counts[j] / initial_n;
-                    // --- Use __ldg() to load from read-only cache ---
                     float log2_count = __ldg(&d_log2_table[temp_counts[j]]);
                     float entropy_term = -p * (log2_count - log2_initial_n);
                     scores[k] += entropy_term * my_coefs[j];
@@ -219,14 +227,47 @@ __global__ void initCurandKernel(curandState* states, unsigned long long seed, i
     }
 }
 
-__global__ void reproduceAndMutateKernel(const float* __restrict__ d_current_pop, float* __restrict__ d_next_pop, const int* __restrict__ d_parent_indices,
-    curandState* __restrict__ states, int population_size, int num_coefs, int num_parents,
-    float mutation_strength)
+// --- MODIFIED --- New kernel for diversity calculation
+__global__ void calculateDiversityKernel(const int* __restrict__ d_population,
+    float* __restrict__ d_diversity_scratch,
+    int population_size, int num_coefs) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= population_size) return;
+
+    float total_distance = 0.0f;
+    for (int i = 0; i < population_size; ++i) {
+        if (i == idx) continue;
+
+        float distance = 0.0f;
+        for (int j = 0; j < num_coefs; ++j) {
+            int diff = d_population[idx * num_coefs + j] - d_population[i * num_coefs + j];
+            distance += diff * diff;
+        }
+        total_distance += sqrtf(distance);
+    }
+
+    d_diversity_scratch[idx] = total_distance / (population_size - 1);
+}
+
+
+// --- MODIFIED --- New enhanced reproduction and mutation kernel
+__global__ void reproduceAndMutateKernel_Adaptive(
+    const int* __restrict__ d_current_pop,
+    int* __restrict__ d_next_pop,
+    const int* __restrict__ d_parent_indices,
+    curandState* __restrict__ states,
+    int population_size,
+    int num_coefs,
+    int num_parents,
+    float mutation_rate,
+    int mutation_amount,
+    int generation)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= population_size) return;
 
-    if (idx < num_parents / 4) { // Keep top 6.25% unchanged (elitism)
+    // 1. ELITISM: Keep more of the best individuals
+    if (idx < num_parents / 2) {  // Increased elite retention
         int parent_idx = d_parent_indices[idx];
 #pragma unroll
         for (int i = 0; i < num_coefs; ++i) {
@@ -236,28 +277,67 @@ __global__ void reproduceAndMutateKernel(const float* __restrict__ d_current_pop
     }
 
     curandState localState = states[idx];
-    int p1_elite_idx = curand(&localState) % num_parents;
-    int p2_elite_idx = curand(&localState) % num_parents;
-    int p1_actual_idx = d_parent_indices[p1_elite_idx];
-    int p2_actual_idx = d_parent_indices[p2_elite_idx];
 
-    int crossover_point = (curand(&localState) % (num_coefs - 1)) + 1;
-#pragma unroll
-    for (int i = 0; i < num_coefs; ++i) {
-        d_next_pop[idx * num_coefs + i] = (i < crossover_point) ?
-            d_current_pop[p1_actual_idx * num_coefs + i] :
-            d_current_pop[p2_actual_idx * num_coefs + i];
+    // 2. IMPROVED PARENT SELECTION: Tournament selection
+    int tournament_size = 3;
+    int p1_idx = 0, p2_idx = 0;
+
+    // Tournament selection for parent 1
+    for (int t = 0; t < tournament_size; ++t) {
+        int candidate = curand(&localState) % num_parents;
+        if (t == 0 || candidate < p1_idx) p1_idx = candidate;
     }
 
+    // Tournament selection for parent 2
+    for (int t = 0; t < tournament_size; ++t) {
+        int candidate = curand(&localState) % num_parents;
+        if (t == 0 || candidate < p2_idx) p2_idx = candidate;
+    }
+
+    int p1_actual_idx = d_parent_indices[p1_idx];
+    int p2_actual_idx = d_parent_indices[p2_idx];
+
+    // 3. UNIFORM CROSSOVER instead of single-point
 #pragma unroll
     for (int i = 0; i < num_coefs; ++i) {
-        d_next_pop[idx * num_coefs + i] += curand_normal(&localState) * mutation_strength;
-        //d_next_pop[idx * num_coefs + i] = fmaxf(0.1f, fminf(3.0f, d_next_pop[idx * num_coefs + i]));
-        d_next_pop[idx * num_coefs + i] = fmaxf(-1.0f, fminf(3.0f, d_next_pop[idx * num_coefs + i]));
+        if (curand_uniform(&localState) < 0.5f) {
+            d_next_pop[idx * num_coefs + i] = d_current_pop[p1_actual_idx * num_coefs + i];
+        }
+        else {
+            d_next_pop[idx * num_coefs + i] = d_current_pop[p2_actual_idx * num_coefs + i];
+        }
+    }
+
+    // 4. ADAPTIVE MUTATION with multiple strategies
+#pragma unroll
+    for (int i = 0; i < num_coefs; ++i) {
+        if (curand_uniform(&localState) < mutation_rate) {
+            float strategy = curand_uniform(&localState);
+
+            if (strategy < 0.7f) {
+                // Standard mutation
+                int mutation = (curand(&localState) % (2 * mutation_amount + 1)) - mutation_amount;
+                d_next_pop[idx * num_coefs + i] += mutation;
+            }
+            else if (strategy < 0.85f) {
+                // Gaussian mutation for fine-tuning
+                float gaussian = curand_normal(&localState);
+                int mutation = (int)(gaussian * mutation_amount * 0.5f);
+                d_next_pop[idx * num_coefs + i] += mutation;
+            }
+            else {
+                // Large random jump for exploration
+                d_next_pop[idx * num_coefs + i] = 1 + (curand(&localState) % 300);
+            }
+
+            // Clamp to valid range
+            d_next_pop[idx * num_coefs + i] = min(300, max(1, d_next_pop[idx * num_coefs + i]));
+        }
     }
 
     states[idx] = localState;
 }
+
 
 // =================================================================================
 //  HOST CODE
@@ -302,22 +382,22 @@ int main() {
     // --- GPU Memory Allocation ---
     int* d_mark; double* d_results; uint64_t* d_sum_scratch;
     uint64_t* d_iValid_scratch;
-    float* d_population_A, * d_population_B;
+    int* d_population_A, * d_population_B; // <<< NOW INTEGER
     int* d_parent_indices; curandState* d_curand_states;
-    // --- We allocate the log table in regular global memory ---
     float* d_log2_table;
+    float* d_diversity_scratch; // <<< NEW
 
     printf("Allocating memory on GPU...\n");
     gpuErrchk(cudaMalloc(&d_mark, (size_t)S * S * sizeof(int)));
     gpuErrchk(cudaMalloc(&d_results, (size_t)POPULATION_SIZE * sizeof(double)));
     gpuErrchk(cudaMalloc(&d_sum_scratch, (size_t)POPULATION_SIZE * sizeof(uint64_t)));
     gpuErrchk(cudaMalloc(&d_iValid_scratch, (size_t)POPULATION_SIZE * S * sizeof(uint64_t)));
-    gpuErrchk(cudaMalloc(&d_population_A, (size_t)POPULATION_SIZE * NUM_COEFS * sizeof(float)));
-    gpuErrchk(cudaMalloc(&d_population_B, (size_t)POPULATION_SIZE * NUM_COEFS * sizeof(float)));
+    gpuErrchk(cudaMalloc(&d_population_A, (size_t)POPULATION_SIZE * NUM_COEFS * sizeof(int)));
+    gpuErrchk(cudaMalloc(&d_population_B, (size_t)POPULATION_SIZE * NUM_COEFS * sizeof(int)));
     gpuErrchk(cudaMalloc(&d_parent_indices, (size_t)NUM_PARENTS * sizeof(int)));
     gpuErrchk(cudaMalloc(&d_curand_states, (size_t)POPULATION_SIZE * sizeof(curandState)));
-    // --- Use cudaMalloc and cudaMemcpy, which is robust ---
     gpuErrchk(cudaMalloc(&d_log2_table, (S + 1) * sizeof(float)));
+    gpuErrchk(cudaMalloc(&d_diversity_scratch, POPULATION_SIZE * sizeof(float))); // <<< NEW
 
     printf("Memory allocated.\n");
 
@@ -330,37 +410,66 @@ int main() {
     gpuErrchk(cudaDeviceSynchronize());
 
     printf("Population Size: %d, Generations: %d\n", POPULATION_SIZE, NUM_GENERATIONS);
-    printf("Starting search... Press Ctrl+C to stop early.\n\n");
+    printf("Starting search...\n\n");
 
-    std::vector<float> h_population_flat(POPULATION_SIZE * NUM_COEFS);
-    //const float initial_coefs[NUM_COEFS] = { 1.10f, 1.07f, 1.04f, 0.81f, 0.62f, 1.02f, 0.95f, 1.05f, 0.88f, 0.92f, 0.79f, 1.02f, 0.80f, 1.93f };
-    const float initial_coefs[NUM_COEFS] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+    // --- MODIFIED --- Better initialization strategy
+    std::vector<int> h_population_flat(POPULATION_SIZE * NUM_COEFS);
+    // --- CHANGE 1: Seed with your known best coefficients (converted to int) ---
+    //const int initial_coefs[NUM_COEFS] = { 110, 107, 104, 81, 62, 102, 95, 105, 88, 92, 79, 102, 80, 193 };
+    const int initial_coefs[NUM_COEFS] = { 124, 134, 135, 95, 86, 125, 133, 117, 103, 110, 113, 130, 105, 232 };
     std::mt19937 rng(std::random_device{}());
-    std::normal_distribution<float> init_dist(0.0f, 0.15f);
-    std::uniform_real_distribution<float> uniform_dist(0.3f, 2.5f);
+
     for (int i = 0; i < POPULATION_SIZE; ++i) {
-        for (int j = 0; j < NUM_COEFS; ++j) {
-            if (i == 0) h_population_flat[i * NUM_COEFS + j] = initial_coefs[j];
-            else if (i < 50) h_population_flat[i * NUM_COEFS + j] = initial_coefs[j] + init_dist(rng);
-            else h_population_flat[i * NUM_COEFS + j] = uniform_dist(rng);
+        if (i == 0) {
+            // Keep the base individual
+            for (int j = 0; j < NUM_COEFS; ++j) {
+                h_population_flat[i * NUM_COEFS + j] = initial_coefs[j];
+            }
+        }
+        else if (i < POPULATION_SIZE / 4) {
+            // Gaussian distribution around base
+            std::normal_distribution<float> gauss_dist(0.0f, 15.0f);
+            for (int j = 0; j < NUM_COEFS; ++j) {
+                int val = initial_coefs[j] + (int)gauss_dist(rng);
+                h_population_flat[i * NUM_COEFS + j] = std::max(1, std::min(300, val));
+            }
+        }
+        else if (i < POPULATION_SIZE / 2) {
+            // Uniform distribution in extended range
+            std::uniform_int_distribution<int> extended_dist(50, 200);
+            for (int j = 0; j < NUM_COEFS; ++j) {
+                h_population_flat[i * NUM_COEFS + j] = extended_dist(rng);
+            }
+        }
+        else {
+            // Full random for diversity
+            std::uniform_int_distribution<int> uniform_dist(1, 300);
+            for (int j = 0; j < NUM_COEFS; ++j) {
+                h_population_flat[i * NUM_COEFS + j] = uniform_dist(rng);
+            }
         }
     }
-    gpuErrchk(cudaMemcpy(d_population_A, h_population_flat.data(), (size_t)POPULATION_SIZE * NUM_COEFS * sizeof(float), cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(d_population_A, h_population_flat.data(), (size_t)POPULATION_SIZE * NUM_COEFS * sizeof(int), cudaMemcpyHostToDevice));
 
-    float* d_current_pop = d_population_A;
-    float* d_next_pop = d_population_B;
+    int* d_current_pop = d_population_A;
+    int* d_next_pop = d_population_B;
 
     double best_ever_score = 999.0;
-    std::vector<float> best_ever_coefs(NUM_COEFS);
-    int generations_without_improvement = 0;
+    std::vector<int> best_ever_coefs(NUM_COEFS); // Store as integer
+
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    // --- MODIFIED --- Add variables for adaptive strategy
+    int stagnation_counter = 0;
+    float current_mutation_rate = INITIAL_MUTATION_RATE;
+    int current_mutation_amount = INITIAL_MUTATION_AMOUNT;
+
+    // --- MODIFIED --- Enhanced main evolution loop
     for (int gen = 0; gen < NUM_GENERATIONS; ++gen) {
         gpuErrchk(cudaMemset(d_sum_scratch, 0, (size_t)POPULATION_SIZE * sizeof(uint64_t)));
 
         const int BATCH_SIZE = 128;
         for (int o_start = 0; o_start < S; o_start += BATCH_SIZE) {
-            // --- The log2 table is now passed as a standard argument ---
             evaluatePopulationKernel_Optimized << <gridSize, blockSize >> > (d_current_pop, d_mark, d_log2_table, d_iValid_scratch, o_start, BATCH_SIZE, d_sum_scratch);
         }
         gpuErrchk(cudaGetLastError());
@@ -378,43 +487,58 @@ int main() {
 
         double best_gen_score = h_results[h_indices[0]];
 
+        // Track improvement
         if (best_gen_score < best_ever_score) {
             best_ever_score = best_gen_score;
+            stagnation_counter = 0;
             int best_individual_idx = h_indices[0];
-            gpuErrchk(cudaMemcpy(best_ever_coefs.data(), &d_current_pop[best_individual_idx * NUM_COEFS], NUM_COEFS * sizeof(float), cudaMemcpyDeviceToHost));
-
+            gpuErrchk(cudaMemcpy(best_ever_coefs.data(), &d_current_pop[best_individual_idx * NUM_COEFS], NUM_COEFS * sizeof(int), cudaMemcpyDeviceToHost));
             auto current_time = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double> elapsed = current_time - start_time;
             printf("T+%.2fs Gen %d: !!! NEW BEST: %.8f !!!\n", elapsed.count(), gen + 1, best_ever_score);
             printf("  Coefficients: [ ");
-            for (int i = 0; i < NUM_COEFS; ++i) printf("%.6f ", best_ever_coefs[i]);
+            for (int i = 0; i < NUM_COEFS; ++i) printf("%.2f ", (float)best_ever_coefs[i] / 100.0f);
             printf("]\n");
-
-            generations_without_improvement = 0;
         }
         else {
-            generations_without_improvement++;
+            stagnation_counter++;
         }
 
-        if ((gen + 1) % 500 == 0) {
-            printf("Gen %d: Current best: %.8f (Best ever: %.8f) Stagnation: %d\n", gen + 1, best_gen_score, best_ever_score, generations_without_improvement);
+        // --- CHANGE 2: Reduce frequency of the expensive diversity calculation ---
+        if (gen > 0 && gen % 50 == 0) {
+            calculateDiversityKernel << <gridSize, blockSize >> > (
+                d_current_pop, d_diversity_scratch, POPULATION_SIZE, NUM_COEFS);
+            gpuErrchk(cudaDeviceSynchronize());
+
+            // Get average diversity
+            std::vector<float> h_diversity(POPULATION_SIZE);
+            gpuErrchk(cudaMemcpy(h_diversity.data(), d_diversity_scratch,
+                POPULATION_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
+
+            float avg_diversity = std::accumulate(h_diversity.begin(), h_diversity.end(), 0.0f) / POPULATION_SIZE;
+
+            // Adapt mutation based on diversity and stagnation
+            if (avg_diversity < 50.0f || stagnation_counter > STAGNATION_THRESHOLD) {
+                current_mutation_rate = std::min(0.3f, current_mutation_rate * 1.5f);
+                current_mutation_amount = std::min(25, current_mutation_amount + 3);
+                printf("  [Diversity: %.2f, Stagnation: %d] Increasing mutation: rate=%.3f, amount=%d\n",
+                    avg_diversity, stagnation_counter, current_mutation_rate, current_mutation_amount);
+                if (stagnation_counter > STAGNATION_THRESHOLD) stagnation_counter = 0; // Reset counter after adapting
+            }
+            else {
+                current_mutation_rate = std::max(MIN_MUTATION_RATE, current_mutation_rate * 0.98f);
+                current_mutation_amount = std::max(MIN_MUTATION_AMOUNT, current_mutation_amount - 1);
+            }
         }
 
         std::vector<int> h_parent_indices(h_indices.begin(), h_indices.begin() + NUM_PARENTS);
         gpuErrchk(cudaMemcpy(d_parent_indices, h_parent_indices.data(), (size_t)NUM_PARENTS * sizeof(int), cudaMemcpyHostToDevice));
 
-        float progress = (float)gen / NUM_GENERATIONS;
-        float current_mutation_strength = INITIAL_MUTATION_STRENGTH * (1.0f - progress) + FINAL_MUTATION_STRENGTH * progress;
-
-        if (generations_without_improvement > 100) {
-            current_mutation_strength *= 1.5f;
-        }
-        else if (generations_without_improvement > 50) {
-            current_mutation_strength *= 1.2f;
-        }
-        current_mutation_strength = fminf(current_mutation_strength, 0.2f);
-
-        reproduceAndMutateKernel << <gridSize, blockSize >> > (d_current_pop, d_next_pop, d_parent_indices, d_curand_states, POPULATION_SIZE, NUM_COEFS, NUM_PARENTS, current_mutation_strength);
+        // Use the enhanced reproduction kernel
+        reproduceAndMutateKernel_Adaptive << <gridSize, blockSize >> > (
+            d_current_pop, d_next_pop, d_parent_indices, d_curand_states,
+            POPULATION_SIZE, NUM_COEFS, NUM_PARENTS,
+            current_mutation_rate, current_mutation_amount, gen);
         gpuErrchk(cudaDeviceSynchronize());
 
         std::swap(d_current_pop, d_next_pop);
@@ -426,9 +550,13 @@ int main() {
     printf("\n--- Optimization Finished ---\n");
     printf("Total runtime: %.2f seconds\n", total_duration.count());
     printf("Best score found: %.8f\n", best_ever_score);
-    printf("Optimal coefficients found:\n[ ");
-    for (int i = 0; i < NUM_COEFS; ++i) printf("%.8f ", best_ever_coefs[i]);
+    printf("Optimal coefficients found (integer representation):\n[ ");
+    for (int i = 0; i < NUM_COEFS; ++i) printf("%d ", best_ever_coefs[i]);
     printf("]\n");
+    printf("Optimal coefficients found (float representation):\n[ ");
+    for (int i = 0; i < NUM_COEFS; ++i) printf("%.2f ", (float)best_ever_coefs[i] / 100.0f);
+    printf("]\n");
+
 
     gpuErrchk(cudaFree(d_mark));
     gpuErrchk(cudaFree(d_results));
@@ -438,8 +566,8 @@ int main() {
     gpuErrchk(cudaFree(d_population_B));
     gpuErrchk(cudaFree(d_parent_indices));
     gpuErrchk(cudaFree(d_curand_states));
-    // --- Remember to free the log table memory ---
     gpuErrchk(cudaFree(d_log2_table));
+    gpuErrchk(cudaFree(d_diversity_scratch)); // <<< NEW
 
     system("pause");
     return 0;
