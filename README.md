@@ -1,5 +1,6 @@
 # MasterMindHeuristics
 # GPU-Accelerated Mastermind Strategy Optimizer
+google-site-verification: google66e268708df4d151.html
 
 This repository contains a high-performance C++/CUDA application that uses a Genetic Algorithm (GA) to find the optimal coefficients for a Mastermind-playing strategy based on Shannon Entropy. The goal is to discover a set of weights that minimizes the average number of guesses required to solve any of the 1,296 possible Mastermind codes (6 colours of 4 peg combinations).
 
